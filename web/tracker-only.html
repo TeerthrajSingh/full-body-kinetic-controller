@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow-Boxer tracker</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2d323b; --text:#e8eaed; --dim:#8b93a1; --hit:#ff5a4d; --ok:#4dd2a1; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1200px; margin:0 auto; }
+  @media (max-width:800px){ main { grid-template-columns:1fr; } }
+  .stage { position:relative; background:#000; border-radius:8px; overflow:hidden; aspect-ratio:4/3; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  #flash { position:absolute; left:12px; top:12px; font-size:28px; font-weight:700; color:var(--hit); text-shadow:0 2px 8px #000; transform:none; }
+  #countdown { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; transform:none; pointer-events:none; text-shadow:0 2px 12px #000; }
+  #countdown .num { font-size:min(22vw,160px); font-weight:800; line-height:1; }
+  #countdown .msg { font-size:20px; }
+  aside { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; display:flex; flex-direction:column; gap:12px; }
+  h1 { font-size:18px; margin:0; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background:var(--line); color:var(--text); border:0; border-radius:6px; padding:8px 12px; font:inherit; cursor:pointer; }
+  button:hover:not(:disabled) { background:#3a404b; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, select:focus-visible { outline:2px solid var(--ok); outline-offset:2px; }
+  select { background:var(--line); color:var(--text); border:0; border-radius:6px; padding:6px 8px; font:inherit; }
+  .stat { color:var(--dim); font-size:13px; }
+  .stat b { color:var(--text); font-weight:600; }
+  #readout { white-space:pre-line; font:12px/1.5 ui-monospace, Menlo, monospace; color:var(--dim); min-height:36px; }
+  #log { flex:1; min-height:160px; max-height:340px; overflow:auto; font:13px/1.6 ui-monospace, Menlo, monospace; background:var(--bg); border-radius:6px; padding:8px; }
+  #log div { border-bottom:1px solid var(--line); }
+  label { font-size:13px; color:var(--dim); display:block; }
+  label.inline { display:flex; gap:6px; align-items:center; }
+  input[type=range] { width:100%; }
+  small { color:var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div id="flash"></div>
+      <div id="countdown" aria-live="assertive"></div>
+    </div>
+  </section>
+
+  <aside>
+    <h1>Shadow-Boxer tracker</h1>
+    <div class="row">
+      <button id="start">Start camera</button>
+      <button id="calib" disabled>Calibrate (stand neutral)</button>
+    </div>
+    <div class="row">
+      <label class="inline">Delegate
+        <select id="delegate"><option value="GPU">GPU</option><option value="CPU">CPU</option></select>
+      </label>
+      <label class="inline">Model
+        <select id="model"><option value="lite">lite (fast)</option><option value="full">full (accurate)</option></select>
+      </label>
+    </div>
+    <div class="stat">Status: <b id="status">idle</b> &nbsp; FPS: <b id="fps">0</b> &nbsp; Infer: <b id="infer">0</b> ms</div>
+
+    <div>
+      <label>Punch sensitivity, arm-lengths/sec (lower = easier to trigger): <b id="punchVal"></b></label>
+      <input id="punchThr" type="range" min="1" max="8" step="0.25" value="2.5">
+      <label>Dodge distance, sideways head shift (shoulder-widths): <b id="dodgeVal"></b></label>
+      <input id="dodgeThr" type="range" min="0.2" max="1.5" step="0.05" value="0.5">
+      <label>Duck depth, head drop (shoulder-widths): <b id="duckVal"></b></label>
+      <input id="duckThr" type="range" min="0.2" max="1.2" step="0.05" value="0.4">
+      <label class="inline"><input id="guardReq" type="checkbox"> Punches must start from guard (stricter, fewer false hits)</label>
+    </div>
+
+    <div id="readout"></div>
+    <div id="log" aria-live="polite"></div>
+    <small>Keyboard fallback: J / K = left / right punch, B = block (toggle), A / D = dodge left / right, S = duck.</small>
+  </aside>
+</main>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+/* ---------- Landmark indexes (MediaPipe Pose) ---------- */
+const NOSE = 0, L_SH = 11, R_SH = 12, L_EL = 13, R_EL = 14, L_WR = 15, R_WR = 16, L_HIP = 23, R_HIP = 24;
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[0,11],[0,12]];
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODELS = {
+  lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+};
+
+/* ---------- Config ----------
+   All gesture distances are in body-relative units (arm lengths / torso lengths),
+   measured on MediaPipe's metric 3D world landmarks, so they don't depend on how
+   far you stand from the camera or on the 4:3 frame shape. */
+const cfg = {
+  // punch
+  punchVel: 2.5,          // wrist reach velocity needed to start a punch, in arm-lengths per second
+  minReach: 0.65,         // at the end of the punch the wrist must be this far from the shoulder (1 = arm fully straight)
+  minElbowAngle: 100,     // degrees at the end of the punch
+  minTravel: 0.2,         // wrist must have moved at least this much (in arm-lengths) away from the shoulder
+  requireGuard: false,    // punch must start from a bent-arm (guard) position
+  guardReach: 0.78,       // reach below this counts as "guard"
+  guardWindowMs: 800,     // ...within this recent window
+  punchCooldownMs: 300,   // same hand: minimum gap between punches
+  punchGlobalCooldownMs: 250, // any hand: after one punch, nothing else fires for this long
+  rearmDrop: 0.2,         // after a punch the hand must pull back this much (arm-lengths) before it can punch again
+  punchTimeoutMs: 450,    // a punch must finish within this time after it starts
+  maxVel: 30,             // velocities above this (arm-lengths/s) are tracking glitches, ignored
+  // block
+  blockDist: 0.7,         // both wrists within this many arm-lengths of the nose
+  blockRelease: 1.25,     // hysteresis: must move this much farther out to release
+  blockHoldMs: 150,
+  // dodge / duck (shoulder-widths, measured in the camera image against the calibrated neutral spot)
+  dodge: 0.5,
+  actionLockoutMs: 350,   // punch and dodge can't trigger within this time of each other
+  duckDrop: 0.4,
+  dodgeCooldownMs: 400,
+  // tracking quality
+  minVis: 0.5,            // ignore landmarks the model isn't confident about
+  lostMs: 300             // no pose for this long = person lost, reset state
+};
+
+/* ---------- DOM ---------- */
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const logEl = $("log"), flashEl = $("flash"), dbgEl = $("readout");
+const punchThr = $("punchThr"), dodgeThr = $("dodgeThr"), guardReq = $("guardReq"), duckThr = $("duckThr");
+const showVals = () => { $("punchVal").textContent = cfg.punchVel; $("dodgeVal").textContent = cfg.dodge; $("duckVal").textContent = cfg.duckDrop; };
+punchThr.oninput = () => { cfg.punchVel = +punchThr.value; showVals(); };
+dodgeThr.oninput = () => { cfg.dodge = +dodgeThr.value; showVals(); };
+duckThr.oninput = () => { cfg.duckDrop = +duckThr.value; showVals(); };
+guardReq.onchange = () => { cfg.requireGuard = guardReq.checked; };
+showVals();
+
+/* ---------- Event bus: Person B listens to this ----------
+   window.addEventListener("gesture", e => console.log(e.detail))
+   detail = { type: "punch"|"block_start"|"block_end"|"dodge"|"duck", hand?, power?, dir?, t }
+   hand / dir are from the PLAYER's point of view and match the mirrored on-screen view. */
+function emit(detail) {
+  detail.t = performance.now();
+  window.dispatchEvent(new CustomEvent("gesture", { detail }));
+}
+window.addEventListener("gesture", (e) => {
+  const d = e.detail;
+  const text = d.type + (d.hand ? " " + d.hand : "") + (d.dir ? " " + d.dir : "") + (d.power ? " p=" + d.power.toFixed(2) : "");
+  const row = document.createElement("div");
+  row.textContent = text;
+  logEl.prepend(row);
+  while (logEl.children.length > 60) logEl.lastChild.remove();
+  if (d.type === "punch" || d.type === "dodge" || d.type === "duck") {
+    flashEl.textContent = text.toUpperCase();
+    clearTimeout(flashEl._t);
+    flashEl._t = setTimeout(() => (flashEl.textContent = ""), 400);
+  }
+});
+
+/* ---------- Math helpers ---------- */
+const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 });
+function angle3(a, b, c) { // angle at b, degrees, in 3D
+  const v1 = [a.x - b.x, a.y - b.y, a.z - b.z], v2 = [c.x - b.x, c.y - b.y, c.z - b.z];
+  const dot = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
+  const cos = dot / (Math.hypot(...v1) * Math.hypot(...v2) + 1e-9);
+  return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+}
+
+/* ---------- One Euro filter: smooth when still, responsive when moving ---------- */
+class OneEuro {
+  constructor(minCutoff, beta, dCutoff = 1) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.x = null; this.dx = 0; this.t = 0;
+  }
+  static alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  filter(v, t) {
+    if (this.x === null) { this.x = v; this.dx = 0; this.t = t; return v; }
+    const dt = Math.max(1e-3, t - this.t); this.t = t;
+    this.dx += OneEuro.alpha(this.dCutoff, dt) * ((v - this.x) / dt - this.dx);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    this.x += OneEuro.alpha(cutoff, dt) * (v - this.x);
+    return this.x;
+  }
+}
+class LandmarkFilter {
+  constructor(minCutoff, beta) { this.mc = minCutoff; this.b = beta; this.f = null; }
+  reset() { this.f = null; }
+  apply(lms, t) {
+    if (!this.f) this.f = lms.map(() => [0, 1, 2].map(() => new OneEuro(this.mc, this.b)));
+    return lms.map((p, i) => ({ x: this.f[i][0].filter(p.x, t), y: this.f[i][1].filter(p.y, t), z: this.f[i][2].filter(p.z, t) }));
+  }
+}
+const worldFilter = new LandmarkFilter(1.2, 3);   // meters
+const viewFilter  = new LandmarkFilter(1.5, 6);   // normalized image coords (drawing only)
+
+/* ---------- Gesture state ---------- */
+const mkHand = (sh, el, wr) => ({
+  sh, el, wr, prevReach: null, prevT: 0, vel: 0, reach: 0,
+  lastPunch: 0, phase: 0, peak: 0, startT: 0, low: 9, lowT: 0, armed: true, maxSince: 0
+});
+const hands = { left: mkHand(L_SH, L_EL, L_WR), right: mkHand(R_SH, R_EL, R_WR) };
+
+let armLen = 0.6, armN = 0;          // running estimate of arm length in meters (bone lengths don't change with pose)
+let blocking = false, blockSince = 0;
+let baseline = null;                 // { hx, hy, sw } head position + shoulder width in the image when standing neutral
+let lastDodge = 0, latchSide = false, latchDuck = false, lastPunchAny = 0;
+const calib = { active: false, samples: [] };
+let countingDown = false;            // true during the pre-calibration countdown (no gestures fire)
+let lastSeen = 0, lost = false, lastDbg = 0, headInfo = "";
+
+function resetTracking() {
+  worldFilter.reset(); viewFilter.reset();
+  for (const h of Object.values(hands)) Object.assign(h, { prevReach: null, vel: 0, phase: 0, peak: 0, low: 9, lowT: 0, armed: true });
+  if (blocking) { blocking = false; emit({ type: "block_end" }); }
+  blockSince = 0; latchSide = false; latchDuck = false;
+}
+
+function process(lm, raw, now, img) {
+  if (countingDown) return;
+  const vis = (i) => (raw[i].visibility ?? 1) >= cfg.minVis;
+
+  const shMid = mid(lm[L_SH], lm[R_SH]), hipMid = mid(lm[L_HIP], lm[R_HIP]);
+  const torso = dist3(shMid, hipMid);
+  if (!(torso > 0.15)) return;                       // implausible pose, skip frame
+
+  /* Arm length: sum of the two arm bones, averaged over visible arms, slowly refined */
+  const samples = [];
+  for (const h of Object.values(hands)) {
+    if (vis(h.sh) && vis(h.el) && vis(h.wr)) samples.push(dist3(lm[h.sh], lm[h.el]) + dist3(lm[h.el], lm[h.wr]));
+  }
+  if (samples.length) {
+    const s = samples.reduce((a, b) => a + b, 0) / samples.length;
+    armN++;
+    armLen += Math.max(0.01, 1 / armN) * (s - armLen);
+    armLen = Math.max(0.35, Math.min(1.0, armLen));
+  }
+
+  /* Punches: wrist extends away from the shoulder fast, from a guard, ending near full extension */
+  const dbg = [];
+  for (const [name, h] of Object.entries(hands)) {
+    if (!(vis(h.sh) && vis(h.el) && vis(h.wr))) { h.prevReach = null; h.phase = 0; h.vel = 0; continue; }
+    const reach = dist3(lm[h.wr], lm[h.sh]) / armLen;       // ~0.3 in guard, ~1.0 straight arm
+    h.reach = reach;
+
+    if (reach < h.low || now - h.lowT > cfg.guardWindowMs) { h.low = reach; h.lowT = now; }  // recent minimum reach
+
+    if (h.prevReach !== null) {
+      const dt = (now - h.prevT) / 1000;
+      if (dt > 0.004 && dt < 0.2) {
+        let v = (reach - h.prevReach) / dt;                  // arm-lengths per second
+        if (Math.abs(v) > cfg.maxVel) v = 0;                 // tracking glitch
+        h.vel += 0.5 * (v - h.vel);
+      } else h.vel = 0;
+    }
+    h.prevReach = reach; h.prevT = now;
+    const ang = angle3(lm[h.sh], lm[h.el], lm[h.wr]);
+    if (!h.armed) {                                          // after a punch, the hand must retract before it can punch again
+      h.maxSince = Math.max(h.maxSince, reach);
+      if (reach < h.maxSince - cfg.rearmDrop) h.armed = true;
+    }
+
+    if (h.phase === 0) {
+      const fromGuard = !cfg.requireGuard || h.low < cfg.guardReach;
+      if (h.vel > cfg.punchVel && fromGuard && now - h.lastPunch > cfg.punchCooldownMs && now - lastPunchAny > cfg.punchGlobalCooldownMs && h.armed && now - lastDodge > cfg.actionLockoutMs) {
+        h.phase = 1; h.peak = h.vel; h.startT = now;
+      }
+    } else {
+      h.peak = Math.max(h.peak, h.vel);
+      const slowed = h.vel < 0.4 * h.peak;
+      const extended = reach >= cfg.minReach && ang > cfg.minElbowAngle && reach - h.low >= cfg.minTravel;
+      if (now - h.startT > cfg.punchTimeoutMs || h.vel < -1) {
+        h.phase = 0;                                         // too slow, or already retracting: not a punch
+      } else if (extended && (slowed || reach >= 0.92)) {
+        h.lastPunch = now; h.phase = 0; h.low = reach; h.lowT = now;
+        lastPunchAny = now; h.armed = false; h.maxSince = reach;
+        for (const o of Object.values(hands)) if (o !== h) o.phase = 0;   // the other arm just swinging along is not a second punch
+        emit({ type: "punch", hand: name, power: Math.min(1, h.peak / (cfg.punchVel * 2)) });
+      }
+    }
+    dbg.push(`${name[0].toUpperCase()} reach ${reach.toFixed(2)} vel ${h.vel.toFixed(1)}`);
+  }
+
+  /* Block: both wrists up near the face, with hysteresis */
+  let nearFace = false;
+  if (vis(L_WR) && vis(R_WR) && vis(NOSE)) {
+    const lim = cfg.blockDist * armLen * (blocking ? cfg.blockRelease : 1);
+    const high = lm[L_WR].y < shMid.y + 0.1 * torso && lm[R_WR].y < shMid.y + 0.1 * torso;   // y grows downward
+    nearFace = high && dist3(lm[L_WR], lm[NOSE]) < lim && dist3(lm[R_WR], lm[NOSE]) < lim;
+  }
+  if (nearFace) {
+    if (!blockSince) blockSince = now;
+    if (!blocking && now - blockSince > cfg.blockHoldMs) { blocking = true; emit({ type: "block_start" }); }
+  } else {
+    blockSince = 0;
+    if (blocking) { blocking = false; emit({ type: "block_end" }); }
+  }
+
+  /* Dodge / duck: head position in the camera IMAGE, relative to the calibrated neutral spot, in shoulder-widths.
+     Image space is used on purpose: when you squat, your hips drop together with your head, so a
+     hip-relative measure never sees the duck. */
+  if (vis(NOSE) && vis(L_SH) && vis(R_SH)) {
+    const aspect = video.videoWidth / video.videoHeight || 4 / 3;
+    const hd = (vis(7) && vis(8)) ? mid(img[7], img[8]) : img[NOSE];   // ear midpoint barely moves when you turn your head
+    const hx = hd.x * aspect, hy = hd.y;
+    const swImg = Math.hypot((img[L_SH].x - img[R_SH].x) * aspect, img[L_SH].y - img[R_SH].y);
+    if (calib.active) { calib.samples.push({ hx, hy, sw: swImg }); }
+    else {
+      if (!baseline) baseline = { hx, hy, sw: swImg };   // fall back to first frame until calibrated
+      const unit = baseline.sw || 0.2;
+      const side = (hx - baseline.hx) / unit;
+      const drop = (hy - baseline.hy) / unit;            // image y grows downward, so positive = head went down
+      headInfo = `head side ${side.toFixed(2)}  drop ${drop.toFixed(2)}`;
+      if (latchSide && Math.abs(side) < cfg.dodge * 0.5) latchSide = false;
+      if (latchDuck && drop < cfg.duckDrop * 0.5) latchDuck = false;
+      const punching = Object.values(hands).some((h) => h.phase === 1 || now - h.lastPunch < cfg.actionLockoutMs);
+      if (!punching && now - lastDodge > cfg.dodgeCooldownMs) {
+        if (!latchDuck && drop > cfg.duckDrop) {
+          lastDodge = now; latchDuck = true;
+          emit({ type: "duck" });
+        } else if (!latchSide && Math.abs(side) > cfg.dodge) {
+          lastDodge = now; latchSide = true;
+          // MediaPipe's +x is the player's LEFT. Direction is from the player's point of view.
+          emit({ type: "dodge", dir: side > 0 ? "left" : "right" });
+        }
+      }
+    }
+  }
+
+  if (now - lastDbg > 200) {
+    lastDbg = now;
+    dbgEl.textContent = dbg.join("  |  ") + `\narm ${armLen.toFixed(2)} m  torso ${torso.toFixed(2)} m\n${headInfo}`;
+  }
+}
+
+/* ---------- Drawing ---------- */
+function draw(lm, raw) {
+  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;   // resizing clears the canvas, so only do it on change
+  }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!lm) return;
+  const W = canvas.width, H = canvas.height;
+  const seen = (i) => (raw[i].visibility ?? 1) >= cfg.minVis;
+  ctx.lineWidth = 3; ctx.strokeStyle = "#4dd2a1";
+  for (const [a, b] of BONES) {
+    if (!seen(a) || !seen(b)) continue;
+    ctx.beginPath(); ctx.moveTo(lm[a].x * W, lm[a].y * H); ctx.lineTo(lm[b].x * W, lm[b].y * H); ctx.stroke();
+  }
+  ctx.fillStyle = "#ffffff";
+  for (const i of [NOSE, L_SH, R_SH, L_EL, R_EL, L_WR, R_WR, L_HIP, R_HIP]) {
+    if (!seen(i)) continue;
+    ctx.beginPath(); ctx.arc(lm[i].x * W, lm[i].y * H, 5, 0, Math.PI * 2); ctx.fill();
+  }
+  if (blocking) { ctx.strokeStyle = "#ffb020"; ctx.lineWidth = 6; ctx.strokeRect(0, 0, W, H); }
+}
+
+/* ---------- Main loop ---------- */
+let landmarker = null, running = false;
+let frames = 0, inferAcc = 0, lastFpsT = performance.now(), lastVideoTime = -1, lastTs = 0;
+
+async function createLandmarker(delegate) {
+  const vision = await FilesetResolver.forVisionTasks(WASM);
+  return PoseLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: MODELS[$("model").value], delegate },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.6,
+    minPosePresenceConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+}
+
+async function start() {
+  $("start").disabled = true; $("delegate").disabled = true; $("model").disabled = true;
+  $("status").textContent = "loading model…";
+  try {
+    const wanted = $("delegate").value;
+    try {
+      landmarker = await createLandmarker(wanted);
+    } catch (gpuErr) {
+      if (wanted !== "GPU") throw gpuErr;
+      $("status").textContent = "GPU failed, falling back to CPU…";
+      $("delegate").value = "CPU";
+      landmarker = await createLandmarker("CPU");
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
+    video.srcObject = stream;
+    await video.play();
+    $("status").textContent = "tracking";
+    $("calib").disabled = false;
+    running = true;
+    schedule();
+  } catch (err) {
+    $("status").textContent = "error: " + err.message;
+    $("start").disabled = false; $("delegate").disabled = false; $("model").disabled = false;
+  }
+}
+
+function schedule() {
+  if (!running) return;
+  if ("requestVideoFrameCallback" in video) video.requestVideoFrameCallback((now) => onFrame(now));
+  else requestAnimationFrame((now) => onFrame(now));
+}
+
+function onFrame(now) {
+  if (!running) return;
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const ts = Math.max(now, lastTs + 1);            // detectForVideo needs strictly increasing timestamps
+    lastTs = ts;
+    let res = null;
+    const t0 = performance.now();
+    try { res = landmarker.detectForVideo(video, ts); } catch (e) { console.error(e); }
+    inferAcc += performance.now() - t0; frames++;
+
+    const raw = res && res.landmarks && res.landmarks[0];
+    const rawW = res && res.worldLandmarks && res.worldLandmarks[0];
+    if (raw && rawW) {
+      lastSeen = ts;
+      if (lost) { lost = false; $("status").textContent = "tracking"; }
+      const w = worldFilter.apply(rawW, ts / 1000);
+      const v = viewFilter.apply(raw, ts / 1000);
+      process(w, raw, ts, v);
+      draw(v, raw);
+    } else {
+      draw(null);
+      if (!lost && ts - lastSeen > cfg.lostMs) {
+        lost = true; resetTracking();
+        $("status").textContent = "no person in view";
+      }
+    }
+  }
+  const t = performance.now();
+  if (t - lastFpsT > 1000) {
+    $("fps").textContent = frames;
+    $("infer").textContent = frames ? (inferAcc / frames).toFixed(0) : 0;
+    frames = 0; inferAcc = 0; lastFpsT = t;
+  }
+  schedule();
+}
+
+$("start").onclick = start;
+
+/* ---------- Calibration ---------- */
+const COUNTDOWN_SECONDS = 10;
+const CAPTURE_MS = 2000;
+const countdownEl = $("countdown");
+
+function showCountdown(num, msg) {
+  countdownEl.innerHTML = "";
+  if (num !== null) { const n = document.createElement("div"); n.className = "num"; n.textContent = num; countdownEl.append(n); }
+  if (msg) { const m = document.createElement("div"); m.className = "msg"; m.textContent = msg; countdownEl.append(m); }
+}
+
+$("calib").onclick = () => {
+  if (countingDown || calib.active) return;
+  countingDown = true;
+  $("calib").disabled = true;
+  let n = COUNTDOWN_SECONDS;
+  const tick = () => {
+    if (n > 0) {
+      showCountdown(n, "Step back and get in position");
+      $("status").textContent = "get ready… " + n;
+      n--;
+      setTimeout(tick, 1000);
+    } else {
+      countingDown = false;
+      calib.samples = []; calib.active = true;
+      showCountdown(null, "Hold still…");
+      $("status").textContent = "calibrating… stand neutral";
+      setTimeout(() => {
+        calib.active = false;
+        showCountdown(null, "");
+        $("calib").disabled = false;
+        const s = calib.samples; calib.samples = [];
+        if (s.length >= 5) {
+          const avg = (k) => s.reduce((a, p) => a + p[k], 0) / s.length;
+          baseline = { hx: avg("hx"), hy: avg("hy"), sw: avg("sw") };
+          latchSide = false; latchDuck = false;
+          $("status").textContent = "calibrated";
+        } else {
+          $("status").textContent = "calibration failed (no pose seen), try again";
+        }
+      }, CAPTURE_MS);
+    }
+  };
+  tick();
+};
+
+/* ---------- Keyboard fallback (same events, so the game can be built without tracking) ---------- */
+let kbBlock = false;
+window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === "j") emit({ type: "punch", hand: "left", power: 0.7 });
+  else if (k === "k") emit({ type: "punch", hand: "right", power: 0.7 });
+  else if (k === "a") emit({ type: "dodge", dir: "left" });
+  else if (k === "d") emit({ type: "dodge", dir: "right" });
+  else if (k === "s") emit({ type: "duck" });
+  else if (k === "b") { kbBlock = !kbBlock; emit({ type: kbBlock ? "block_start" : "block_end" }); }
+});
+</script>
+</body>
+</html>
