@@ -25,7 +25,7 @@ You need **Chrome or Edge**, a **webcam**, and an **internet connection** (the p
 The camera only works on `localhost` or HTTPS, so run a tiny local server:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/TeerthrajSingh/full-body-kinetic-controller
 cd full-body-kinetic-controller/web
 python3 -m http.server 8000
 ```
